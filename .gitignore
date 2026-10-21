@@ -1,0 +1,11 @@
+# 凭据/环境文件绝不入库(含服务器密码)
+rexec*.py
+*.log
+rev.log
+# 本地构建/解包产物
+arpfanout-*.tar.gz
+v1*/
+repo/
+# 系统杂物
+.DS_Store
+Thumbs.db

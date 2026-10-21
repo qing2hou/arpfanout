@@ -1,0 +1,14 @@
+#!/bin/bash
+# arpfanout-uninstall — 彻底卸载
+systemctl disable --now arpfanout 2>/dev/null
+for d in /sys/class/net/*/bonding; do
+  [ -d "$d" ] || continue
+  b=$(basename "$(dirname "$d")")
+  tc qdisc del dev "$b" clsact 2>/dev/null
+done
+rm -f /sys/fs/bpf/arpfanout 2>/dev/null
+rm -f /etc/systemd/system/arpfanout.service /etc/default/arpfanout
+rm -f /usr/local/sbin/arpfanout /usr/local/sbin/arpfanout-remove /usr/local/sbin/arpfanout-uninstall
+rm -rf /usr/local/lib/arpfanout
+systemctl daemon-reload
+echo "arpfanout: uninstalled"

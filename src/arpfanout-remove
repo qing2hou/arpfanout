@@ -1,0 +1,11 @@
+#!/bin/bash
+# arpfanout-remove — 紧急回滚: 停守护进程 + 摘除所有 bond 上的双发(网络立即恢复内核默认)
+# 只回滚运行状态, 不卸载安装的文件
+systemctl stop arpfanout 2>/dev/null
+for d in /sys/class/net/*/bonding; do
+  [ -d "$d" ] || continue
+  b=$(basename "$(dirname "$d")")
+  tc qdisc del dev "$b" clsact 2>/dev/null && echo "clsact removed: $b"
+done
+rm -f /sys/fs/bpf/arpfanout 2>/dev/null && echo "pinned prog removed"
+echo "arpfanout: rolled back (files kept; systemctl start arpfanout to re-enable)"

@@ -1,0 +1,16 @@
+[Unit]
+Description=eBPF ARP/NDP fanout on 802.3ad bonds (one-shot at boot, manual re-trigger)
+Documentation=file:/usr/local/lib/arpfanout/arpfanout.bpf.c
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-/etc/default/arpfanout
+# boot: 最多等30s让 bond 出现(防开机竞态), 然后同步一次即退出
+ExecStart=/usr/local/sbin/arpfanout boot
+# bond 变化后的手动收敛入口: systemctl restart arpfanout
+
+[Install]
+WantedBy=multi-user.target

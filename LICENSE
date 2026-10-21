@@ -1,0 +1,12 @@
+GNU GENERAL PUBLIC LICENSE
+Version 2, June 1991
+
+Copyright (C) 1989, 1991 Free Software Foundation, Inc.
+51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA
+
+Everyone is permitted to copy and distribute verbatim copies of this
+license document, but changing it is not allowed.
+
+本仓库以 GPL-2.0 发布（完整条款见 https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt）。
+选择 GPL-2.0 的原因：eBPF 程序使用的内核 helper（bpf_clone_redirect 等）仅在 GPL 兼容
+许可下可用，BPF 程序的 LICENSE 段已声明 "GPL"，仓库整体保持一致。

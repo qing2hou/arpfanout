@@ -1,0 +1,155 @@
+#!/bin/bash
+# arpfanout — eBPF ARP/NDP 双发管理(一次性收敛 + 手动触发; watch 常驻为可选)
+#
+# 模式:
+#   arpfanout sync    一次性全量收敛: 发现 bond → 挂载 → map diff, 完成即退出(幂等)
+#   arpfanout boot    开机入口(systemd 调用): 最多等 ARP_FANOUT_BOOT_WAIT 秒让 bond
+#                     被 networkd/netplan 建好, 再做一次 sync(避免开机竞态)
+#   arpfanout watch   常驻: netlink 事件 + 轮询双通道自动跟随(默认不用, 备用)
+#
+# 生产使用(默认形态): 开机自动跑一次 boot; 之后 bond 变化(重建/增删成员)手动触发:
+#   systemctl restart arpfanout        # 或等效: arpfanout sync
+#
+# 配置(/etc/default/arpfanout):
+#   ARP_FANOUT_BONDS=""       空=跟随系统内所有 bond; 否则白名单, 如 "bond0 bond2"
+#   ARP_FANOUT_BOOT_WAIT=30   boot 模式等待 bond 出现的最长秒数
+#   ARP_FANOUT_POLL=5         watch 模式轮询兜底间隔(秒)
+#
+# 回滚: arpfanout-remove | 卸载: arpfanout-uninstall
+
+BPF_OBJ=${ARP_FANOUT_OBJ:-/usr/local/lib/arpfanout/arpfanout.bpf.o}
+PIN=${ARP_FANOUT_PIN:-/sys/fs/bpf/arpfanout}
+BONDS_WHITELIST=${ARP_FANOUT_BONDS:-}
+BOOT_WAIT=${ARP_FANOUT_BOOT_WAIT:-30}
+POLL=${ARP_FANOUT_POLL:-5}
+BPFTOOL=$(command -v bpftool || echo /usr/sbin/bpftool)
+TAG="arpfanout"
+
+log() { echo "$TAG: $*"; }
+
+hex32() {  # u32 -> bpftool 所需字节序(little-endian)十六进制
+  local v=$1
+  printf '%02x %02x %02x %02x' $((v&255)) $((v>>8&255)) $((v>>16&255)) $((v>>24&255))
+}
+
+all_bonds() {
+  local b d
+  if [ -n "$BONDS_WHITELIST" ]; then
+    for b in $BONDS_WHITELIST; do
+      [ -d "/sys/class/net/$b/bonding" ] && echo "$b"
+    done
+  else
+    for d in /sys/class/net/*/bonding; do
+      [ -d "$d" ] && basename "$(dirname "$d")"
+    done
+  fi
+}
+
+map_ids() {
+  $BPFTOOL map show name slave_tbl 2>/dev/null | awk -F: '/^[0-9]+:/ {gsub(/ /,"",$1); print $1}'
+}
+
+ensure_prog() {
+  [ -e "$PIN" ] && return 0
+  if $BPFTOOL prog load "$BPF_OBJ" "$PIN" 2>/dev/null; then
+    log "prog loaded -> $PIN (map slave_tbl created)"
+    return 0
+  fi
+  log "WARN: prog load failed from $BPF_OBJ"
+  return 1
+}
+
+tc_attached() {  # bond egress 是否已挂我们的 filter
+  tc filter show dev "$1" egress 2>/dev/null | grep -q arpfanout
+}
+
+sync_now() {
+  ensure_prog || return 1
+
+  local bonds b bidx s ifx slot
+  bonds=$(all_bonds)
+
+  # 1. attach: 每个 bond 保证有 clsact + pinned 程序
+  for b in $bonds; do
+    if ! tc_attached "$b"; then
+      tc qdisc show dev "$b" 2>/dev/null | grep -q clsact || \
+        tc qdisc add dev "$b" clsact 2>/dev/null
+      if tc filter add dev "$b" egress bpf da pinned "$PIN" 2>/dev/null; then
+        log "attached: $b"
+      else
+        log "WARN: attach failed: $b"
+      fi
+    fi
+  done
+
+  # 2. 期望的 map 状态: "bondifindex slot slaveifindex"
+  local want=/run/arpfanout.want
+  : > "$want"
+  for b in $bonds; do
+    bidx=$(cat "/sys/class/net/$b/ifindex" 2>/dev/null) || continue
+    slot=0
+    for s in $(cat "/sys/class/net/$b/bonding/slaves" 2>/dev/null); do
+      ifx=$(cat "/sys/class/net/$s/ifindex" 2>/dev/null) || continue
+      echo "$bidx $slot $ifx" >> "$want"
+      slot=$((slot+1))
+    done
+  done
+
+  # 3. 上轮写入、本轮不需要的键 → 删除(重建/成员减少/消失)
+  local prev=/run/arpfanout.state pb ps _junk
+  touch "$prev"
+  while read -r pb ps _junk; do
+    [ -n "${pb:-}" ] || continue
+    if ! grep -q "^$pb $ps " "$want"; then
+      for mid in $(map_ids); do
+        $BPFTOOL map delete id "$mid" key hex $(hex32 "$pb") $(hex32 "$ps") \
+          >/dev/null 2>&1 || true
+      done
+      log "map drop: bond=$pb slot=$ps (gone/changed)"
+    fi
+  done < "$prev"
+
+  # 4. upsert 期望键
+  while read -r bidx slot ifx; do
+    [ -n "${bidx:-}" ] || continue
+    for mid in $(map_ids); do
+      $BPFTOOL map update id "$mid" key hex $(hex32 "$bidx") $(hex32 "$slot") \
+        value hex $(hex32 "$ifx") >/dev/null 2>&1 || true
+    done
+  done < "$want"
+
+  cp -f "$want" "$prev"
+  log "sync ok: bonds=[$(echo $bonds | tr '\n' ' ')] entries=$(wc -l < "$want")"
+}
+
+sync_locked() { { flock -x 9; sync_now; } 9>/run/arpfanout.lock; }
+
+case "${1:-sync}" in
+  sync)
+    sync_locked ;;
+
+  boot)  # 开机入口: 等 bond 被网络配置建好, 再同步一次
+    i=0
+    while [ "$i" -lt "$BOOT_WAIT" ]; do
+      [ -n "$(all_bonds)" ] && break
+      log "boot: 尚未发现 bond, 等待网络配置 ... ($((BOOT_WAIT-i))s)"
+      sleep 1; i=$((i+1))
+    done
+    sync_locked ;;
+
+  watch)  # 常驻模式(可选): 事件 + 轮询双通道
+    trap 'kill $MON_PID 2>/dev/null; exit 0' TERM INT
+    ( stdbuf -oL ip monitor link 2>/dev/null | \
+        while read -r _; do sync_locked; done ) &
+    MON_PID=$!
+    log "watch started: poll=${POLL}s obj=$BPF_OBJ"
+    while true; do
+      sync_locked
+      sleep "$POLL" &
+      wait $!
+    done ;;
+
+  *)
+    echo "用法: arpfanout [sync|boot|watch]  (默认 sync)" >&2
+    exit 2 ;;
+esac
