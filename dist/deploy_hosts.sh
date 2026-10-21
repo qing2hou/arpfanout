@@ -39,7 +39,7 @@ for h in "${HOSTS[@]}"; do
   echo "=============== $u@$h ==============="
   if SSHPASS="$PASS" sshpass -e scp -o StrictHostKeyChecking=no -o ConnectTimeout=8 "$PKG" "$u@$h:/tmp/" \
   && SSHPASS="$PASS" sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=8 "$u@$h" \
-       "cd /tmp && rm -rf arpfanout-1.4 && tar xzf arpfanout-1.4.tar.gz && cd arpfanout-1.4 && \
+       "cd /tmp && rm -rf arpfanout-1.5 && tar xzf "$(basename $PKG)" && cd arpfanout-1.5 && \
         bash check.sh && $SUDO bash install.sh && $SUDO bash test_v6.sh"; then
     OK+=("$h")
   else
