@@ -117,9 +117,15 @@ clsact+filter → 按当前成员维护 map 表项（多删少补）。
 
 **Q：`tcpdump -i any` 抓成员口出现 `ARP, Unknown Hardware (2214) ... Unknown Protocol (0x0000) (len 1)` 乱码——线上帧坏了吗？**
 
-没有。部分内核/驱动组合下，VLAN tag 由驱动层插入的帧在 `-i any`（SLL2 cooked 模式）捕获点会
-错位呈现：cooked 头的 protocol 字段仍报 0x0806，而 tag 字节出现在载荷开头，tcpdump 便把 tag
-字节当作 ARP 头读出乱码（`length 32 = 28 + 4` 正好说明只是多了 tag 字节）。线上帧本身是正确的。
+没有。部分内核/驱动/libpcap 组合下，`-i any`（SLL2 cooked 模式）的协议解析会错位 4 字节，
+tcpdump 把捕获头尾部的字节当作 ARP 头读出乱码。**判别指纹**：乱码里 "Unknown Hardware (N)"
+的字节值等于**帧发送方 MAC 的最后两字节**——出向（本机双发克隆）= 本机 bond MAC 的尾巴，
+入向（网关请求）= 网关 MAC（如 `00:00:00:00:00:01`）的尾巴 `00 01`。由于乱码字节来自捕获
+视图而非线路，线上帧本身是正确的（具体接口原始模式抓包可复核）。
+
+**入向包在 `-i any` 下会呈现三层 tap**：同一包 `enX In`、`bond0 In`（均乱码、length=46+4）、
+`bond0.2101 In`（干净解码、length=46）——VLAN tag 在成员口/bond 层还在数据里、到 vlan 子口
+层被剥到元数据。看入向真相直接读 vlan 子口那行即可。
 
 **判别/验证一律用具体成员口 + 原始模式，不要用 `-i any`：**
 
