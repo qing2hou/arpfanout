@@ -107,6 +107,32 @@ clsact+filter → 按当前成员维护 map 表项（多删少补）。
 > **适用前提**：仅用于 leaf 真正独立的去堆叠环境。若环境仍存在堆叠/MLAG，同一 MAC 从两个
 > 聚合口出现会触发交换机 MAC 漂移告警——有堆叠就不需要本方案。
 
+## FAQ / 已知坑（tcpdump 观测）
+
+**Q：`tcpdump -i any` 里看不到 `bond0 Out` 行，成员口出现成对的 `Out` 行——正常吗？**
+
+正常，这正是双发生效的表现。eBPF 在 bond 的 tc egress 截获原包并丢弃（`TC_ACT_SHOT`），克隆通过
+`bpf_clone_redirect` 直接注入各成员口层，原包不再经过 bond 驱动的发射点，所以 `-i any` 下没有
+`bond0 Out` 行；`en0`/`en1` 各一行、微秒级同刻、内容一致，就是双发的标准签名。
+
+**Q：`tcpdump -i any` 抓成员口出现 `ARP, Unknown Hardware (2214) ... Unknown Protocol (0x0000) (len 1)` 乱码——线上帧坏了吗？**
+
+没有。部分内核/驱动组合下，VLAN tag 由驱动层插入的帧在 `-i any`（SLL2 cooked 模式）捕获点会
+错位呈现：cooked 头的 protocol 字段仍报 0x0806，而 tag 字节出现在载荷开头，tcpdump 便把 tag
+字节当作 ARP 头读出乱码（`length 32 = 28 + 4` 正好说明只是多了 tag 字节）。线上帧本身是正确的。
+
+**判别/验证一律用具体成员口 + 原始模式，不要用 `-i any`：**
+
+```bash
+tcpdump -i <成员口> -en -c 4 arp
+# 健康长相：
+# 94:a6:..:08:a6 > ff:ff:ff:ff:ff:ff, ethertype 802.1Q (0x8100), length 46:
+#   vlan 2101, p 0, ethertype ARP (0x0806), Request who-has ... length 28
+```
+
+另注：任播网关（全 0 类虚 MAC）对同一目标的询问可能从两个成员口先后到达（两张 leaf 独立解析），
+本机对每个询问产生一个应答、每个应答又被双发——成员口上看到"两问两答×双份"属于正常现象。
+
 ## License
 
 GPL-2.0（与 Linux 内核 BPF helper 使用许可一致）
