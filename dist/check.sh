@@ -21,8 +21,25 @@ command -v systemctl >/dev/null && ok "systemd 存在" \
 
 echo "== 3. 工具链 =="
 command -v tc >/dev/null && ok "tc $(tc -V 2>&1 | head -1)" || no "缺 tc (Debian/Ubuntu: apt install iproute2; RHEL/Rocky等: dnf install iproute-tc)"
-command -v bpftool >/dev/null && ok "bpftool 存在" \
-  || inf "缺 bpftool: install.sh 会尝试自动装(Ubuntu: linux-tools-\$(uname -r); RHEL系: bpftool)"
+BPFTOOL_BIN=""
+bpftool_works() { [ -x "$1" ] && "$1" version >/dev/null 2>&1; }
+cand=$(command -v bpftool 2>/dev/null) || cand=""
+if [ -n "$cand" ] && bpftool_works "$cand"; then
+  BPFTOOL_BIN=$cand
+  ok "bpftool $("$BPFTOOL_BIN" version 2>/dev/null | head -1)"
+else
+  # 当前内核的 wrapper 不可用(内核升级后 linux-tools 没跟上): 找已安装的真身兜底
+  for cand in "/usr/lib/linux-tools/$(uname -r)/bpftool" \
+              $(ls -1d /usr/lib/linux-tools/*/bpftool 2>/dev/null | sort -Vr 2>/dev/null); do
+    if bpftool_works "$cand"; then BPFTOOL_BIN=$cand; break; fi
+  done
+  if [ -n "$BPFTOOL_BIN" ]; then
+    inf "当前内核 $(uname -r) 的 bpftool 不可用, 运行时将兜底使用: $BPFTOOL_BIN"
+    ok "bpftool $("$BPFTOOL_BIN" version 2>/dev/null | head -1)"
+  else
+    no "bpftool 不可用: apt install linux-tools-$(uname -r) (RHEL系: dnf install bpftool)"
+  fi
+fi
 command -v clang >/dev/null && ok "clang $(clang --version | head -1 | awk '{print $3}')" \
   || inf "无 clang: x86_64 用预编译对象即可; 其他架构需要安装"
 
@@ -36,13 +53,17 @@ fi
 if mountpoint -q /sys/fs/bpf; then BPFS=yes; ok "bpffs 已挂载";
 elif mount -t bpf bpf /sys/fs/bpf 2>/dev/null; then BPFS=yes; ok "bpffs 已挂载(本次新挂)";
 else BPFS=no; no "bpffs 无法挂载"; fi
-if [ "$BPFS" = yes ] && [ -f arpfanout.bpf.o ] && command -v bpftool >/dev/null; then
-  if bpftool prog load arpfanout.bpf.o /sys/fs/bpf/af_check 2>/dev/null; then
+if [ "$BPFS" = yes ] && [ -f arpfanout.bpf.o ]; then
+  if [ -z "$BPFTOOL_BIN" ]; then
+    inf "bpftool 不可用, 跳过 BPF 对象加载验证"
+  elif out=$("$BPFTOOL_BIN" prog load arpfanout.bpf.o /sys/fs/bpf/af_check 2>&1); then
     rm -f /sys/fs/bpf/af_check
     ok "BPF 对象实际加载验证通过 ($(uname -m))"
   else
     rm -f /sys/fs/bpf/af_check
-    no "预编译对象加载失败: 安装 clang 后 install.sh 会现场编译(x86_64 加载失败请反馈)"
+    no "预编译对象加载失败, bpftool 原始报错:"
+    printf '%s\n' "$out" | sed 's/^/         /'
+    inf "x86_64 不需要现场编译; 先按上面的报错处理(bpftool/内核/权限)"
   fi
 fi
 

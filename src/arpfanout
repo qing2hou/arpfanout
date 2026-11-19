@@ -14,6 +14,10 @@
 #   ARP_FANOUT_BONDS=""       空=跟随系统内所有 bond; 否则白名单, 如 "bond0 bond2"
 #   ARP_FANOUT_BOOT_WAIT=30   boot 模式等待 bond 出现的最长秒数
 #   ARP_FANOUT_POLL=5         watch 模式轮询兜底间隔(秒)
+#   ARP_FANOUT_PREF=49152     tc filter 优先级(数值越小越先执行); 显式固定,
+#                             避免内核自动分配导致与其他组件规则顺序漂移
+#   ARP_FANOUT_BPFTOOL=""     可选: bpftool 绝对路径(默认自动探测, 兼容内核升级后
+#                             Ubuntu wrapper 找不到对应 linux-tools 的情况)
 #
 # 回滚: arpfanout-remove | 卸载: arpfanout-uninstall
 
@@ -22,7 +26,8 @@ PIN=${ARP_FANOUT_PIN:-/sys/fs/bpf/arpfanout}
 BONDS_WHITELIST=${ARP_FANOUT_BONDS:-}
 BOOT_WAIT=${ARP_FANOUT_BOOT_WAIT:-30}
 POLL=${ARP_FANOUT_POLL:-5}
-BPFTOOL=$(command -v bpftool || echo /usr/sbin/bpftool)
+PREF=${ARP_FANOUT_PREF:-49152}
+BPFTOOL=${ARP_FANOUT_BPFTOOL:-}
 TAG="arpfanout"
 
 log() { echo "$TAG: $*"; }
@@ -30,6 +35,32 @@ log() { echo "$TAG: $*"; }
 hex32() {  # u32 -> bpftool 所需字节序(little-endian)十六进制
   local v=$1
   printf '%02x %02x %02x %02x' $((v&255)) $((v>>8&255)) $((v>>16&255)) $((v>>24&255))
+}
+
+# Ubuntu 的 /usr/sbin/bpftool 是按运行内核精确匹配的 wrapper: 内核升级后
+# 对应的 linux-tools-$(uname -r) 没装, wrapper 直接失败(且不一定有二进制可执行)。
+# 这里自己找可用的真身: 当前内核 → PATH → 同系列 → 任意已安装版本。
+bpftool_ok() { [ -x "$1" ] && "$1" version >/dev/null 2>&1; }
+
+resolve_bpftool() {
+  local krel kbase cand
+  if [ -n "${ARP_FANOUT_BPFTOOL:-}" ]; then
+    bpftool_ok "$ARP_FANOUT_BPFTOOL" && echo "$ARP_FANOUT_BPFTOOL"
+    return
+  fi
+  krel=$(uname -r)
+  kbase=${krel%-*}
+  cand="/usr/lib/linux-tools/$krel/bpftool"
+  bpftool_ok "$cand" && { echo "$cand"; return; }
+  cand=$(command -v bpftool 2>/dev/null || true)
+  [ -n "$cand" ] && bpftool_ok "$cand" && { echo "$cand"; return; }
+  # 同系列(如 5.15.0-*)优先, 版本号新的优先; bpftool 跨 ABI 小版本向后兼容
+  for cand in $(ls -1d /usr/lib/linux-tools/"$kbase"-*/bpftool 2>/dev/null | sort -Vr 2>/dev/null); do
+    bpftool_ok "$cand" && { echo "$cand"; return; }
+  done
+  for cand in $(ls -1d /usr/lib/linux-tools/*/bpftool 2>/dev/null | sort -Vr 2>/dev/null); do
+    bpftool_ok "$cand" && { echo "$cand"; return; }
+  done
 }
 
 all_bonds() {
@@ -50,35 +81,97 @@ map_ids() {
 }
 
 ensure_prog() {
+  if [ -z "$BPFTOOL" ]; then
+    BPFTOOL=$(resolve_bpftool)
+  fi
+  if [ -z "$BPFTOOL" ] || ! bpftool_ok "$BPFTOOL"; then
+    log "ERROR: 没有可用的 bpftool (运行内核 $(uname -r))"
+    log "       修复: apt install linux-tools-\$(uname -r) linux-tools-generic  (RHEL系: dnf install bpftool)"
+    [ -n "${ARP_FANOUT_BPFTOOL:-}" ] && log "       配置的 ARP_FANOUT_BPFTOOL=$ARP_FANOUT_BPFTOOL 不可用"
+    return 1
+  fi
+  if [ -z "${BPFTOOL_LOGGED:-}" ]; then
+    log "bpftool: $BPFTOOL"
+    BPFTOOL_LOGGED=1
+  fi
   [ -e "$PIN" ] && return 0
-  if $BPFTOOL prog load "$BPF_OBJ" "$PIN" 2>/dev/null; then
+  local out rc
+  out=$($BPFTOOL prog load "$BPF_OBJ" "$PIN" 2>&1); rc=$?
+  if [ "$rc" -eq 0 ]; then
     log "prog loaded -> $PIN (map slave_tbl created)"
     return 0
   fi
-  log "WARN: prog load failed from $BPF_OBJ"
+  log "WARN: prog load failed (rc=$rc) from $BPF_OBJ"
+  # 不再吞掉 bpftool/验证器的真实报错: 逐行转进 journal
+  if [ -n "$out" ]; then
+    printf '%s\n' "$out" | while IFS= read -r l; do log "bpftool: $l"; done
+  fi
   return 1
 }
 
-tc_attached() {  # bond egress 是否已挂我们的 filter
-  tc filter show dev "$1" egress 2>/dev/null | grep -q arpfanout
+# 输出本设备 egress 上属于 arpfanout 的 filter: "pref handle" (每行一条)
+our_filters() {
+  tc filter show dev "$1" egress 2>/dev/null | awk '
+    /^filter/ {
+      pref = ""; handle = "";
+      for (i = 1; i <= NF; i++) {
+        if ($i == "pref")   pref = $(i + 1);
+        if ($i == "handle") handle = $(i + 1);
+      }
+      if ($0 ~ /arpfanout/) print pref, handle;
+    }'
+}
+
+# 精确删除本设备的 arpfanout filter; $2 为需要保留的 pref(可空)。
+# 只按 "名称 + pref + handle" 删自己的, 不碰 clsact 上的其他规则。
+del_our_filters() {
+  local b=$1 keep=${2:-} pref handle
+  our_filters "$b" | while read -r pref handle; do
+    [ -n "$pref" ] || continue
+    [ -n "$keep" ] && [ "$pref" = "$keep" ] && continue
+    if [ -n "$handle" ]; then
+      tc filter del dev "$b" egress pref "$pref" handle "$handle" bpf 2>/dev/null || true
+    else
+      tc filter del dev "$b" egress pref "$pref" bpf 2>/dev/null || true
+    fi
+    log "filter removed: $b pref=$pref${handle:+ handle=$handle}"
+  done
+}
+
+tc_attached() {  # bond egress 的 $PREF 上是否已挂我们的 filter
+  our_filters "$1" | awk -v p="$PREF" '$1 == p { found = 1 } END { exit !found }'
 }
 
 sync_now() {
+  case "$PREF" in
+    ''|*[!0-9]*)
+      log "ERROR: ARP_FANOUT_PREF 必须是 1-65535 的数字: '$PREF'"
+      return 1 ;;
+  esac
+  if [ "$PREF" -lt 1 ] || [ "$PREF" -gt 65535 ]; then
+    log "ERROR: ARP_FANOUT_PREF 必须是 1-65535 的数字: '$PREF'"
+    return 1
+  fi
+
   ensure_prog || return 1
 
-  local bonds b bidx s ifx slot
+  local bonds b bidx s ifx slot out
   bonds=$(all_bonds)
 
-  # 1. attach: 每个 bond 保证有 clsact + pinned 程序
+  # 1. attach: 每个 bond 保证有 clsact + pinned 程序(固定 pref)
   for b in $bonds; do
     if ! tc_attached "$b"; then
       tc qdisc show dev "$b" 2>/dev/null | grep -q clsact || \
         tc qdisc add dev "$b" clsact 2>/dev/null
-      if tc filter add dev "$b" egress bpf da pinned "$PIN" 2>/dev/null; then
-        log "attached: $b"
+      if out=$(tc filter add dev "$b" egress pref "$PREF" bpf da pinned "$PIN" 2>&1); then
+        log "attached: $b pref=$PREF"
       else
-        log "WARN: attach failed: $b"
+        log "WARN: attach failed: $b pref=$PREF: $out"
       fi
+    fi
+    # 新 pref 已确保挂上后, 清理旧 pref 遗留的 arpfanout filter(不动其他组件)
+    if tc_attached "$b"; then
+      del_our_filters "$b" "$PREF"
     fi
   done
 

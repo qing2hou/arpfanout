@@ -1,10 +1,35 @@
 #!/bin/bash
 # arpfanout-uninstall — 彻底卸载
+# 只删除 arpfanout 自己的 filter(按名称+pref+handle), 保留 clsact 及其他组件的规则。
+our_filters() {
+  tc filter show dev "$1" egress 2>/dev/null | awk '
+    /^filter/ {
+      pref = ""; handle = "";
+      for (i = 1; i <= NF; i++) {
+        if ($i == "pref")   pref = $(i + 1);
+        if ($i == "handle") handle = $(i + 1);
+      }
+      if ($0 ~ /arpfanout/) print pref, handle;
+    }'
+}
+
+del_our_filters() {
+  local b=$1 pref handle
+  our_filters "$b" | while read -r pref handle; do
+    [ -n "$pref" ] || continue
+    if [ -n "$handle" ]; then
+      tc filter del dev "$b" egress pref "$pref" handle "$handle" bpf 2>/dev/null || true
+    else
+      tc filter del dev "$b" egress pref "$pref" bpf 2>/dev/null || true
+    fi
+  done
+}
+
 systemctl disable --now arpfanout 2>/dev/null
 for d in /sys/class/net/*/bonding; do
   [ -d "$d" ] || continue
   b=$(basename "$(dirname "$d")")
-  tc qdisc del dev "$b" clsact 2>/dev/null
+  del_our_filters "$b"
 done
 rm -f /sys/fs/bpf/arpfanout 2>/dev/null
 rm -f /etc/systemd/system/arpfanout.service /etc/default/arpfanout

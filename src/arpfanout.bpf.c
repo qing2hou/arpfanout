@@ -5,10 +5,13 @@
 //
 // 行为:
 //   - 双发对象: IPv4 ARP(0x0806) 与 IPv6 NDP(ICMPv6 type 133-136: RS/RA/NS/NA)
-//   - 非 ARP/NDP 流量一律 TC_ACT_OK, 业务流量仍由 bonding 做 hash,零影响
+//   - 非 ARP/NDP 流量返回 TC_ACT_UNSPEC(交还 tc filter 链, 排在后面的自建
+//     filter 照常执行; 链尾的 UNSPEC 等价默认放行), 业务流量仍由 bonding
+//     做 hash, 零影响
 //   - 命中的帧按表克隆到该 bond 的每个成员口 egress (bpf_clone_redirect)
 //   - 克隆成功后吞掉原包(否则 hash 选中的口会重复发一份)
-//   - 查不到任何成员配置时放行原包,避免配置缺失时 ARP 被黑洞(部署安全序)
+//   - 查不到任何成员配置时同样返回 UNSPEC, 配置缺失时 ARP 不会被黑洞
+//     (部署安全序), 也不会截断后续 filter
 //
 // VLAN: vlan 子接口(bondX.N)的 ARP/NDP 走到 bond 层时, tag 在 skb 元数据
 // (vlan_tci)里, 帧字节里 h_proto 仍是 0x0806/0x86dd, 一次匹配覆盖所有 VLAN;
@@ -69,7 +72,9 @@ static __always_inline void *l3_ptr(struct __sk_buff *skb, __be16 *inner_proto)
 static __always_inline int is_arp(struct __sk_buff *skb)
 {
     __be16 p;
-    l3_ptr(skb, &p);
+
+    if (!l3_ptr(skb, &p))
+        return 0;
     return p == bpf_htons(ETH_P_ARP);
 }
 
@@ -98,8 +103,10 @@ int arp_fanout(struct __sk_buff *skb)
     struct bond_key k = {};
     int sent = 0;
 
+    /* 不归本程序管的流量: 返回 UNSPEC, 让 tc 继续遍历后续 filter
+     * (直接动作模式下 OK/SHOT 都会终止分类链) */
     if (!is_arp(skb) && !is_nd(skb))
-        return TC_ACT_OK;
+        return TC_ACT_UNSPEC;
 
     k.bond = skb->ifindex;
 
@@ -115,7 +122,7 @@ int arp_fanout(struct __sk_buff *skb)
             sent++;
         }
     }
-    return sent ? TC_ACT_SHOT : TC_ACT_OK;
+    return sent ? TC_ACT_SHOT : TC_ACT_UNSPEC;
 }
 
 char LICENSE[] SEC("license") = "GPL";

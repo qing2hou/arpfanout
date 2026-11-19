@@ -7,6 +7,34 @@ SBIN=/usr/local/sbin
 LIBDIR=/usr/local/lib/arpfanout
 
 say(){ echo "install: $*"; }
+
+# 本设备 egress 上属于 arpfanout 的 filter: "pref handle" (每行一条)
+our_filters() {
+  tc filter show dev "$1" egress 2>/dev/null | awk '
+    /^filter/ {
+      pref = ""; handle = "";
+      for (i = 1; i <= NF; i++) {
+        if ($i == "pref")   pref = $(i + 1);
+        if ($i == "handle") handle = $(i + 1);
+      }
+      if ($0 ~ /arpfanout/) print pref, handle;
+    }'
+}
+
+# 只删 arpfanout 自己的 filter, 保留 clsact 及其他组件规则
+del_our_filters() {
+  local b=$1 pref handle
+  our_filters "$b" | while read -r pref handle; do
+    [ -n "$pref" ] || continue
+    if [ -n "$handle" ]; then
+      tc filter del dev "$b" egress pref "$pref" handle "$handle" bpf 2>/dev/null || true
+    else
+      tc filter del dev "$b" egress pref "$pref" bpf 2>/dev/null || true
+    fi
+    say "旧 filter 已摘: $b pref $pref${handle:+ handle $handle}"
+  done
+}
+
 [ "$(id -u)" = 0 ] || { echo "ERROR: 需要 root 运行"; exit 1; }
 
 # --- 1. 依赖: tc + bpftool(缺则按发行版自动装一次) ---
@@ -24,8 +52,15 @@ if ! command -v tc >/dev/null; then
   fi
 fi
 command -v tc >/dev/null || { echo "ERROR: tc 不可用 (Debian/Ubuntu: apt install iproute2; RHEL/Rocky/openEuler: dnf install iproute-tc)"; exit 1; }
-if ! command -v bpftool >/dev/null; then
-  say "bpftool 缺失, 尝试自动安装 ..."
+# 注意: Ubuntu 的 /usr/sbin/bpftool 只是 wrapper, 必须验证当前内核的工具真身可用;
+# 只看 command -v 会把“wrapper 存在但 linux-tools 没装”误判为正常。
+bpftool_works() { [ -x "$1" ] && "$1" version >/dev/null 2>&1; }
+BPFTOOL=""
+cand=$(command -v bpftool 2>/dev/null) || cand=""
+if [ -n "$cand" ] && bpftool_works "$cand"; then
+  BPFTOOL=$cand
+else
+  say "bpftool 不可用(常见于内核升级后 linux-tools 未跟上), 尝试自动安装 ..."
   if command -v apt-get >/dev/null; then
     apt-get install -y linux-tools-common "linux-tools-$(uname -r)" 2>/dev/null \
       || apt-get install -y linux-tools-common linux-tools-generic 2>/dev/null || true
@@ -36,8 +71,28 @@ if ! command -v bpftool >/dev/null; then
   elif command -v zypper >/dev/null; then
     zypper --non-interactive install bpftool 2>/dev/null || true
   fi
+  cand=$(command -v bpftool 2>/dev/null) || cand=""
+  if [ -n "$cand" ] && bpftool_works "$cand"; then BPFTOOL=$cand; fi
 fi
-command -v bpftool >/dev/null || { echo "ERROR: bpftool 不可用 (Ubuntu: apt install linux-tools-\$(uname -r); RHEL/openEuler: dnf install bpftool)"; exit 1; }
+# 仍不可用: 退到已安装的 linux-tools 真身(与 arpfanout 运行时探测顺序一致)
+if [ -z "$BPFTOOL" ]; then
+  for cand in "/usr/lib/linux-tools/$(uname -r)/bpftool" \
+              $(ls -1d /usr/lib/linux-tools/*/bpftool 2>/dev/null | sort -Vr 2>/dev/null); do
+    if bpftool_works "$cand"; then BPFTOOL=$cand; break; fi
+  done
+fi
+[ -n "$BPFTOOL" ] || {
+  echo "ERROR: bpftool 不可用 (运行内核 $(uname -r)): apt install linux-tools-$(uname -r) (或 dnf install bpftool)"
+  exit 1
+}
+say "bpftool: $BPFTOOL"
+# Ubuntu: 装 meta 包, 后续内核升级时自动带上对应的 linux-tools
+if command -v apt-get >/dev/null && apt-cache show linux-tools-generic >/dev/null 2>&1; then
+  dpkg -s linux-tools-generic >/dev/null 2>&1 || {
+    say "安装 linux-tools-generic (后续内核升级自动跟随工具链) ..."
+    apt-get install -y linux-tools-generic 2>/dev/null || true
+  }
+fi
 
 # --- 2. bpffs ---
 mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf
@@ -58,17 +113,14 @@ if [ "$ARCH" != x86_64 ]; then
   fi
 fi
 
-# --- 4. 干净升级: 停服务; 只摘除各 bond 上属于我们的 filter(按 pref 精确删, 不动其他组件的); 删 pin ---
+# --- 4. 干净升级: 停服务; 精确摘除各 bond 上属于我们的 filter(名称+pref+handle),
+#        保留 clsact 和其他组件的规则; 删 pin ---
 systemctl stop arpfanout 2>/dev/null || true
 if [ -e /sys/fs/bpf/arpfanout ]; then
   for d in /sys/class/net/*/bonding; do
     [ -d "$d" ] || continue
     b=$(basename "$(dirname "$d")")
-    for P in $(tc filter show dev "$b" egress 2>/dev/null | grep arpfanout \
-               | grep -o 'pref [0-9]*' | awk '{print $2}' | sort -u); do
-      tc filter del dev "$b" egress pref "$P" 2>/dev/null || true
-      say "旧 filter 已摘: $b pref $P"
-    done
+    del_our_filters "$b"
   done
   rm -f /sys/fs/bpf/arpfanout
 fi
@@ -76,6 +128,7 @@ fi
 # --- 5. 落盘(保留目标机已有的 /etc/default/arpfanout 配置, 不覆盖) ---
 mkdir -p $LIBDIR
 install -m 0644 "$OBJ" $LIBDIR/arpfanout.bpf.o
+install -m 0644 "$SRC/arpfanout.bpf.c" $LIBDIR/arpfanout.bpf.c
 install -m 0755 "$SRC/arpfanout" $SBIN/arpfanout
 install -m 0755 "$SRC/arpfanout-remove" $SBIN/
 install -m 0755 "$SRC/arpfanout-uninstall" $SBIN/
@@ -90,6 +143,6 @@ if ! systemctl is-active --quiet arpfanout; then
   echo "ERROR: 服务未运行, 请查 journalctl -u arpfanout -n 20"; exit 1
 fi
 BONDS=$(for d in /sys/class/net/*/bonding; do basename "$(dirname "$d")"; done | tr '\n' ' ')
-N=$(bpftool map dump name slave_tbl 2>/dev/null | grep -c 'bond' || true)
+N=$("$BPFTOOL" map dump name slave_tbl 2>/dev/null | grep -c 'bond' || true)
 say "完成: bonds=[$BONDS] map条目≈$N"
 say "回滚: arpfanout-remove | 卸载: arpfanout-uninstall | 日志: journalctl -u arpfanout -f"

@@ -23,7 +23,8 @@
 - **IPv4 ARP + IPv6 NDP（RS/RA/NS/NA）** 双发
 - **多 bond**：一份程序 + 一张 map，按 `(bond ifindex, slot)` 键控，任意数量、任意命名的 bond 互不串扰
 - **VLAN 零配置**：vlan 子接口（`bondX.N`）的 ARP/NDP 走到 bond 层时 tag 在 skb 元数据里，克隆自动携带
-- **非 ARP/NDP 流量零影响**：业务流量仍走 bonding 原生哈希，每包开销只有十几条指令的协议判断
+- **非 ARP/NDP 流量零影响**：返回 `TC_ACT_UNSPEC` 把包交还 tc filter 链，排在后面的自建规则照常执行；业务流量仍走 bonding 原生哈希，每包开销只有十几条指令的协议判断
+- **与自建 tc 规则共存**：filter pref 显式固定（默认 49152，可配置），回滚/卸载只删自己的 filter，不碰 clsact 上的其他规则
 - **安全退化**：程序未挂载/表未配置时精确退化为内核默认行为，永不黑洞；运行时挂载、`arpfanout-remove` 一键回滚
 - **无 CO-RE 依赖**：程序只解析 RFC 定义的协议字段，一个预编译 `.o` 跨内核版本加载
 - **生产运行模型**：systemd oneshot（开机自动跑一次 + bond 变化后手动 `systemctl restart arpfanout` 收敛）；常驻 `watch` 模式可选
@@ -77,6 +78,7 @@ systemctl restart arpfanout
 - `ARP_FANOUT_BONDS=""` —— 空=跟随所有 bond；或白名单如 `"bond0 bond2"`
 - `ARP_FANOUT_BOOT_WAIT=30` —— 开机等待 bond 出现的最长秒数
 - `ARP_FANOUT_POLL=5` —— 仅 watch 模式使用的轮询间隔
+- `ARP_FANOUT_BPFTOOL=""` —— 可选：手工指定 bpftool 绝对路径；默认自动探测（当前内核 → PATH → 同系列/任意已安装的 linux-tools）
 
 ## 兼容性
 
@@ -85,27 +87,57 @@ systemctl restart arpfanout
 - **发行版**：Ubuntu/Debian/CentOS/Rocky/openEuler/麒麟等均可（tc 包名：Debian 系 `iproute2`，RHEL 系 `iproute-tc`）
 - **已实测**：Ubuntu 22.04（内核 5.15）、openEuler 24.03（内核 6.6）
 - 拿不准的机器直接跑 `check.sh`，它会对 clsact 挂载和 BPF 对象加载做真实验证
+- **内核升级后 bpftool 自动兜底**：Ubuntu 的 `/usr/sbin/bpftool` 是按运行内核精确匹配的 wrapper，内核升级后 `linux-tools-$(uname -r)` 没跟上就会直接失败。`arpfanout` 不依赖这个 wrapper，会依次尝试当前内核的真身、PATH、同系列/任意已安装的 `linux-tools`；`install.sh` 在 Ubuntu 系还会装 `linux-tools-generic` meta 包，让后续内核升级自动带上工具链。若机器上一个可用的 bpftool 都没有，才需要手工 `apt install linux-tools-$(uname -r)`。
 
 **资源占用**：eBPF 程序常驻内核内存约 8KB（程序 + map），oneshot 模型零常驻用户态进程；
 非 ARP/NDP 流量的每包开销为纳秒级协议判断。唯一"占用"是每个 bond 的 tc egress 挂载位
-（一条 `pref 49152` filter）——若机器上有其他组件管理 bond 的 tc 挂载（如部分 CNI），先评估冲突。
+（一条固定 `pref` 的 filter，默认 49152，可用 `ARP_FANOUT_PREF` 调整）——若机器上有其他
+组件管理 bond 的 tc 挂载（如部分 CNI），先评估冲突。
 
 ## 实现原理
 
 内核发包路径中，tc egress 钩子位于"协议栈已把包交给 bond 之后、bonding 驱动选成员口
 **之前**"。程序在这里：
 
-1. 解析帧：非 ARP/NDP → `TC_ACT_OK` 原样放行（业务流量零影响）
+1. 解析帧：非 ARP/NDP → `TC_ACT_UNSPEC` 交还 filter 链（后面的自建规则照常执行；链尾等价默认放行）
 2. 命中 ARP（0x0806）或 NDP（ICMPv6 133–136）→ 以 `{bond ifindex, slot}` 查 `slave_tbl` map
 3. 对每个成员口 `bpf_clone_redirect()`（skb_clone 后直接注入该成员口发送队列，携带 VLAN 元数据）
 4. 全部克隆后 `TC_ACT_SHOT` 丢弃原包（防止 bonding 哈希再发第三份）
-5. 查不到表 → `TC_ACT_OK` 放行（安全兜底，永不黑洞）
+5. 查不到表 → `TC_ACT_UNSPEC` 放行（安全兜底，永不黑洞，也不截断后续 filter）
 
 用户态 `arpfanout sync` 负责"表与现实一致"：扫 sysfs 发现 bond → 给缺挂载的 bond 补
 clsact+filter → 按当前成员维护 map 表项（多删少补）。
 
 > **适用前提**：仅用于 leaf 真正独立的去堆叠环境。若环境仍存在堆叠/MLAG，同一 MAC 从两个
 > 聚合口出现会触发交换机 MAC 漂移告警——有堆叠就不需要本方案。
+
+## 与自建 tc 规则共存
+
+clsact egress 是一条按 `pref` 升序执行的 filter 链。`bpf da`（direct-action）分类器
+返回 `TC_ACT_OK`/`TC_ACT_SHOT` 会终止整条链，因此 v1.7 起 arpfanout 对**非 ARP/NDP
+流量统一返回 `TC_ACT_UNSPEC`**（"我不处理，继续找下一个 filter"），只有命中 ARP/NDP
+时才 `SHOT`。据此按下面的约定布置自建规则即可互不干扰：
+
+- **只看业务流量的规则**：放在任意 pref 都可以；arpfanout 返回 UNSPEC，不会遮蔽它们。
+- **需要看到 ARP/NDP 的规则**：放在 `ARP_FANOUT_PREF`（默认 49152）**之前**，且匹配
+  ARP/NDP 时不要给出终止 verdict（u32/flower 不匹配自然返回 UNSPEC；不要用
+  `matchall`/全匹配 flower 盖住 ARP/NDP，否则双发会失效）。
+- **QoS/限速**：优先挂 root qdisc（`tc qdisc add dev bond0 root htb` + `parent 1:`）。
+  clsact egress 与 root qdisc 是两条独立路径，互不影响。
+- **pref 冲突**：同一个 pref 上不能混用不同 kind（内核报 `EINVAL`）。arpfanout 的 pref
+  可用 `/etc/default/arpfanout` 里的 `ARP_FANOUT_PREF` 调整，避开其他组件的占位。
+- **回滚/升级**：`arpfanout-remove`/`uninstall`/`install.sh` 只按"名称 + pref + handle"
+  删除 arpfanout 自己的 filter，会保留 clsact 及其他组件的规则。
+
+验证顺序和是否被遮蔽：
+
+```bash
+tc filter show dev bond0 egress                    # 看 pref 顺序
+tc filter add dev bond0 egress pref 60000 protocol all \
+  u32 match ip protocol 1 0xff action pass         # 金丝雀(放在 arpfanout 之后)
+ping -c 5 <网关>
+tc -s filter show dev bond0 egress                 # 金丝雀计数应持续增长
+```
 
 ## FAQ / 已知坑（tcpdump 观测）
 
